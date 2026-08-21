@@ -1,0 +1,14 @@
+# Результаты сборки
+src/.deps/
+src/doc/
+src/synthDrivers/newfon/lib/
+src/synthDrivers/newfon/*.db
+src/*.pot
+src/locale/*/LC_MESSAGES/*.mo
+src/newfon.nvda-addon
+Newfon_core/build/
+__pycache__/
+
+# Клоны, с которых всё началось: держатся рядом для сверки, в репозиторий не входят
+/newfon/
+/ru_tts/

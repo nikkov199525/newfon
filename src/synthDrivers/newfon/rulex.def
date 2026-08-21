@@ -1,0 +1,5 @@
+LIBRARY rulex
+EXPORTS
+rulexdb_open
+rulexdb_search
+rulexdb_close

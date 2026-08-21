@@ -1,0 +1,9 @@
+LIBRARY newfon
+EXPORTS
+tts_create
+tts_destroy
+tts_speak
+tts_setVolume
+tts_setInterpolation
+newfon_config_init
+newfon_voice_name

@@ -1,0 +1,15 @@
+[submodule "Newfon_core"]
+	path = Newfon_core
+	url = https://github.com/nikkov199525/Newfon_core
+[submodule "external/rulex"]
+	path = external/rulex
+	url = https://github.com/poretsky/rulex
+[submodule "external/lmdb"]
+	path = external/lmdb
+	url = https://github.com/LMDB/lmdb
+[submodule "external/pcre2"]
+	path = external/pcre2
+	url = https://github.com/PCRE2Project/pcre2
+[submodule "external/libsamplerate"]
+	path = external/libsamplerate
+	url = https://github.com/nikkov199525/libsamplerate
