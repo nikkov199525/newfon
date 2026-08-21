@@ -122,10 +122,18 @@ exit /b 0
 
 rem ----------------------------------------------------- добавить подмодуль
 :add
-git submodule status "%~1" >nul 2>&1
+rem Проверка именно на подмодуль: git submodule status возвращает ноль
+rem и для обычного каталога, поэтому смотрим права 160000 в индексе
+git ls-files --stage -- "%~1" | findstr /b /c:"160000 " >nul
 if not errorlevel 1 (
 	echo   %~1 уже подключён
 	exit /b 0
+)
+git ls-files --error-unmatch -- "%~1" >nul 2>&1
+if not errorlevel 1 (
+	echo   %~1 лежит в репозитории обычными файлами, убираю из индекса
+	git rm -r --cached --quiet -- "%~1"
+	if errorlevel 1 exit /b 1
 )
 if exist "%~1" (
 	echo   заменяю локальную копию %~1
