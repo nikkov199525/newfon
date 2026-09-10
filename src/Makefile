@@ -11,6 +11,12 @@ ifeq ($(ARCH), x64)
 TARGET = x86_64-w64-mingw32
 endif
 
+
+RULEX_DEFS = -DPCRE2_STATIC
+ifneq ($(ARCH), x64)
+RULEX_DEFS += -DMDB_VL32
+endif
+
 TARGET_CC = $(TARGET)-$(CC)
 TARGET_DEPS_DIR = $(DEPS_DIR)/$(TARGET)
 
@@ -18,23 +24,15 @@ WITH_X86 = yes
 WITH_X64 = yes
 WITH_RULEX = yes
 
-# msgfmt из состава gettext в Windows обычно отсутствует, поэтому
-# по умолчанию используется входящая в проект реализация на Python
+
 MSGFMT = python -B msgfmt.py
 ZIP = 7z
 
 CFLAGS = -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-label -Wno-unused-but-set-variable -Wno-logical-op-parentheses -Wno-sign-compare -Wno-implicit-fallthrough -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-unknown-pragmas -O3
 LDFLAGS = -static -s
-# lrint/lrintf есть в mingw-w64 для обеих архитектур, поэтому libsamplerate
-# не нужно подставлять собственные реализации на ассемблере. В config.h форка
-# это уже учтено, флаги оставлены на случай другой копии библиотеки
 SAMPLERATE_FLAGS = -DHAVE_LRINT=1 -DHAVE_LRINTF=1
 RULEX_LIBS = -lpthread -lpcre2-posix -lpcre2-8
 CORE_OBJS = utterance.o transcription.o time_planner.o text2speech.o synth.o speechrate_control.o soundproducer.o sink.o numerics.o male.o intonator.o female.o voices.o
-# База rulex завязана на разрядность: файл LMDB, собранный 64-разрядной
-# программой, 32-разрядная библиотека не открывает и наоборот. Поэтому
-# для каждой разрядности собирается своя база своим lexholder
-LEXHOLDER_X86 = $(DEPS_DIR)/bin/lexholder-x86.exe
 LEXHOLDER_X64 = $(DEPS_DIR)/bin/lexholder-x64.exe
 DOC_FILES = doc/ru/readme.html
 PO_FILES = $(wildcard locale/*/LC_MESSAGES/nvda.po)
@@ -66,13 +64,12 @@ override TARGET_LIBS += $(SYNTH_DIR)/lib/x64/newfon.dll
 endif
 
 ifeq ($(WITH_RULEX),yes)
+override ADDON_FILES += $(SYNTH_DIR)/rulex.db
 ifeq ($(WITH_X86),yes)
 override TARGET_LIBS += $(SYNTH_DIR)/lib/x86/rulex.dll
-override ADDON_FILES += $(SYNTH_DIR)/rulex-x86.db
 endif
 ifeq ($(WITH_X64),yes)
 override TARGET_LIBS += $(SYNTH_DIR)/lib/x64/rulex.dll
-override ADDON_FILES += $(SYNTH_DIR)/rulex-x64.db
 endif
 endif
 
@@ -119,16 +116,13 @@ $(DEPS_DIR)/%/done:
 	$(MAKE) PREFIX="$(DEPS_DIR)/$*" CC=$*-$(CC) SRC_DIR="$(CURDIR)/$(EXT_DIR)/pcre2" CMAKE_SYSTEM_NAME=Windows -f pcre2.mk
 	touch $@
 
-# lexholder собирается той же разрядности, что и база, которую он наполняет
+# lexholder, наполняющий базу, собирается 64-разрядным, см. LEXHOLDER_X64
 define build_lexholder
 	mkdir -p $(dir $@)
 	$(1)-$(CC) $(CFLAGS) -DPCRE2_STATIC -I$(EXT_DIR)/lmdb/libraries/liblmdb -I$(DEPS_DIR)/$(1)/include -o $@ $(filter %.c,$^) -L$(DEPS_DIR)/$(1)/lib $(LDFLAGS) $(RULEX_LIBS)
 endef
 
 LEXHOLDER_SOURCES = access_utf8.c lexholder.c lexdb.c coder.c mdb.c midl.c module.c
-
-$(LEXHOLDER_X86): $(LEXHOLDER_SOURCES) $(DEPS_DIR)/i686-w64-mingw32/done
-	$(call build_lexholder,i686-w64-mingw32)
 
 $(LEXHOLDER_X64): $(LEXHOLDER_SOURCES) $(DEPS_DIR)/x86_64-w64-mingw32/done
 	$(call build_lexholder,x86_64-w64-mingw32)
@@ -139,7 +133,7 @@ newfon-dll: newfon_nvda.o samplerate.o src_linear.o src_zoh.o $(CORE_OBJS)
 
 .PHONY: rulex-dll
 rulex-dll: access_utf8.c lexdb.c coder.c mdb.c midl.c module.c $(TARGET_DEPS_DIR)/done
-	$(TARGET_CC) $(CFLAGS) -DPCRE2_STATIC -I$(EXT_DIR)/lmdb/libraries/liblmdb -I$(TARGET_DEPS_DIR)/include -shared -o $(TARGET_LIB_DIR)/rulex.dll $(SYNTH_DIR)/rulex.def $(filter %.c,$^) -L$(TARGET_DEPS_DIR)/lib $(LDFLAGS) $(RULEX_LIBS)
+	$(TARGET_CC) $(CFLAGS) $(RULEX_DEFS) -I$(EXT_DIR)/lmdb/libraries/liblmdb -I$(TARGET_DEPS_DIR)/include -shared -o $(TARGET_LIB_DIR)/rulex.dll $(SYNTH_DIR)/rulex.def $(filter %.c,$^) -L$(TARGET_DEPS_DIR)/lib $(LDFLAGS) $(RULEX_LIBS)
 
 define build_lexicon
 	@rm -f $@
@@ -157,10 +151,7 @@ define build_lexicon
 	$(1) -f $(LEXICON_DIR)/correction.rules -C $@
 endef
 
-$(SYNTH_DIR)/rulex-x86.db: $(LEXHOLDER_X86) $(LEXICON_DATA)
-	$(call build_lexicon,$(LEXHOLDER_X86))
-
-$(SYNTH_DIR)/rulex-x64.db: $(LEXHOLDER_X64) $(LEXICON_DATA)
+$(SYNTH_DIR)/rulex.db: $(LEXHOLDER_X64) $(LEXICON_DATA)
 	$(call build_lexicon,$(LEXHOLDER_X64))
 
 newfon.nvda-addon: $(ADDON_FILES)

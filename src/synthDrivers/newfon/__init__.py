@@ -7,7 +7,6 @@ import threading
 import sys
 import queue
 import re
-import unicodedata
 from pathlib import Path
 from collections import OrderedDict
 from ctypes import *
@@ -17,7 +16,7 @@ import config
 import addonHandler
 import globalVars
 import nvwave
-from configobj import ConfigObj
+from configobj import ConfigObj, flatten_errors
 try:
 	from configobj.validate import Validator
 except ImportError: # NVDA ниже 2023.1
@@ -34,7 +33,7 @@ except ImportError: # NVDA ниже 2020.1
 	from driverHandler import DriverSetting, NumericDriverSetting, BooleanDriverSetting, StringParameterInfo
 from logHandler import log
 
-from .languages import en, hr, pl, ru, sr, uk
+from .languages import hr, pl, ru, sr, uk
 
 addonHandler.initTranslation()
 
@@ -44,11 +43,11 @@ ARCH = "x64" if sys.maxsize > 2**32 else "x86"
 LIB_DIR = MODULE_DIR.joinpath("lib", ARCH)
 NEWFON_LIB_PATH = LIB_DIR.joinpath("newfon.dll")
 RULEX_LIB_PATH = LIB_DIR.joinpath("rulex.dll")
-# Файл базы LMDB завязан на разрядность, поэтому для 32 и 64 разрядов
-# в дополнении лежат разные базы
-RULEX_DB_PATH = MODULE_DIR.joinpath("rulex-%s.db" % ARCH)
-if not RULEX_DB_PATH.is_file():
-	RULEX_DB_PATH = MODULE_DIR.joinpath("rulex.db")
+# База одна на обе разрядности: она в 64-разрядном формате LMDB, а 32-разрядная
+# rulex.dll собрана с MDB_VL32 и потому тоже открывает её, см. Makefile
+RULEX_DB_PATH = MODULE_DIR.joinpath("rulex.db")
+# Значения параметров хранятся в newfon.ini в каталоге конфигурации NVDA.
+# config.spec описывает параметры и задаёт умолчания для тех, которых в файле нет
 CONFIG_FILE_PATH = Path(globalVars.appArgs.configPath, "newfon.ini")
 CONFIG_SPEC_PATH = MODULE_DIR.joinpath("config.spec")
 NEWFON_CALLBACK = CFUNCTYPE(c_int, c_void_p, c_size_t, c_void_p)
@@ -79,6 +78,18 @@ RE_CAMEL_CASE = re.compile(
 RE_LETTER_AFTER_NUMBER = re.compile(r"\d[а-яёa-z]", re.I)
 RE_SINGLE_LATIN = re.compile(r"(?<![а-яёa-z])[a-z](?![а-яёa-z])", re.I)
 RE_BRAILLE_PATTERNS = re.compile(r"[⠀-⣿]")
+
+def _characterMap(section):
+	result = {}
+	for ch, value in section.items():
+		ch = str(ch).lower()
+		if len(ch) != 1:
+			continue
+		if isinstance(value, (list, tuple)):
+			# Значение с запятыми без кавычек configobj превращает в список
+			value = ", ".join(value)
+		result[ch] = str(value)
+	return result
 
 # Text chunking mirrors the Android driver: a short first segment keeps
 # startup latency low, while larger following segments reduce core restarts.
@@ -214,23 +225,41 @@ FLAGS_PARAM = "flags"
 CALLBACK_CONTINUE_SYNTHESIS = 0
 CALLBACK_ABORT_SYNTHESIS = 1
 
+class SpeechGeneration(object):
+	# Каждая отмена речи начинает новое поколение, и всё, что осталось от
+	# прежнего, отбрасывается. Прежний флаг тишины сбрасывался отдельным
+	# заданием в очереди, и при быстрых повторных отменах рабочий поток мог
+	# сбросить его раньше времени и продолжить отменённую речь. У счётчика
+	# такой гонки нет. Меняет его только основной поток
+	def __init__(self):
+		self.value = 0
+
 class AudioCallback(object):
 
-	def __init__(self, silence_flag, player):
-		self.__silence_flag = silence_flag
+	def __init__(self, generation, player):
+		self.__generation = generation
 		self.__player = player
+		# Поколение речи, которую сейчас синтезирует рабочий поток
+		self.speechGeneration = None
 
 	def setPlayer(self, player):
 		self.__player = player
 
+	def __isCancelled(self):
+		return self.speechGeneration != self.__generation.value
+
 	def __call__(self, buffer, size, user_data):
-		if self.__silence_flag.is_set():
+		if self.__isCancelled():
 			return CALLBACK_ABORT_SYNTHESIS
 		try:
 			if size > 0:
 				data = string_at(buffer, size*sizeof(c_short))
 				self.__player.feed(data)
-			if self.__silence_flag.is_set():
+			if self.__isCancelled():
+				# Отмена пришла, пока кусок передавался проигрывателю. Если
+				# stop() успел отработать до feed(), кусок заиграл бы заново
+				# и звучал бы уже после отмены, поэтому глушим его здесь
+				self.__player.stop()
 				return CALLBACK_ABORT_SYNTHESIS
 			return CALLBACK_CONTINUE_SYNTHESIS
 		except Exception:
@@ -273,39 +302,17 @@ class RulexDict(object):
 		finally:
 			self.__rulexdb = None
 
-class SpeakText(object):
+class SpeechTask(object):
+	# Задание, относящееся к конкретной речи: текст, индекс или завершение
+	# речи. При отмене такие задания выбрасываются из очереди, а остальные
+	# (смена параметров, громкости, интерполяции) сохраняются
 
-	def __init__(self, text, lib, tts, tts_config, silence_flag, indexes, onIndexReached):
-		self.__text = text
-		self.__lib = lib
-		self.__tts = tts
-		self.__config = tts_config
-		self.__silence_flag = silence_flag
-		self.__indexes = indexes
-		self.__onIndexReached = onIndexReached
+	def __init__(self, func, *args):
+		self.__func = func
+		self.__args = args
 
 	def __call__(self):
-		if self.__silence_flag.is_set():
-			return
-		for chunk in _sourceSegments(self.__text):
-			chunk = " ".join(chunk.split())
-			text = b''.join([c if c else b' ' for c in [c.encode("koi8-r", errors="ignore") for c in chunk]])
-			if text:
-				self.__lib.tts_speak(self.__tts, byref(self.__config), text)
-		for index in self.__indexes:
-			if self.__silence_flag.is_set():
-				return
-			self.__onIndexReached(index)
-
-class DoneSpeaking(object):
-
-	def __init__(self, player, onIndexReached):
-		self.__player = player
-		self.__onIndexReached = onIndexReached
-
-	def __call__(self):
-		self.__player.idle()
-		self.__onIndexReached(None)
+		self.__func(*self.__args)
 
 class SetParameter(object):
 
@@ -377,11 +384,21 @@ class SynthDriver(SynthDriver):
 			defaultVal=self.__useLegacyRateAlgo,
 			useConfig=False,
 		))
+		# Как и в оригинальном Newfon, чтение десятичных дробей выключается
+		# из настроек синтезатора. Значения хранятся в newfon.ini
 		settings.append(BooleanDriverSetting(
-			"pseudoEnglishPronunciation",
-			_("Include pseudo &english pronunciation"),
+			"decimalFractionsPoint",
+			_("Read decimal fractions with a point"),
 			availableInSettingsRing=True,
-			defaultVal=True,
+			defaultVal=self.__decSepPoint,
+			useConfig=False,
+		))
+		settings.append(BooleanDriverSetting(
+			"decimalFractionsComma",
+			_("Read decimal fractions with a comma"),
+			availableInSettingsRing=True,
+			defaultVal=self.__decSepComma,
+			useConfig=False,
 		))
 		if self.__rulex_dict is not None:
 			rulexSetting = BooleanDriverSetting("useRulex", _("Use RuLex pronunciation dictionary"), availableInSettingsRing=True, defaultVal=True)
@@ -407,7 +424,7 @@ class SynthDriver(SynthDriver):
 
 		self.__config = NEWFON_CONF_T()
 		self.__newfon_lib.newfon_config_init(byref(self.__config))
-		self.__user_config = self._getUserConfiguration()
+		self.__user_config = self._loadUserConfiguration()
 
 		params = self.__user_config["Parameters"]
 		self.__sampleRate = params["samples_per_sec"]
@@ -419,13 +436,7 @@ class SynthDriver(SynthDriver):
 		self.__decSepComma = bool(params["dec_sep_comma"])
 		self.__useLegacyRateAlgo = bool(params["UseLegacyRateAlgo"])
 		self.__config.flags = self._speechFlags()
-
-		self.__normalizationForm = None
-		if params["use_unicode_normalization"]:
-			validForms = ("NFC", "NFKC", "NFD", "NFKD")
-			form = params["unicode_normalization_form"]
-			if form in validForms:
-				self.__normalizationForm = form
+		self._applyTextConfiguration()
 
 		self.__rulex_dict = None
 		try:
@@ -441,8 +452,8 @@ class SynthDriver(SynthDriver):
 			self.__outputDevice = config.conf["speech"]["outputDevice"]
 		self.__player = self._createPlayer()
 
-		self.__silence_flag = threading.Event()
-		self.__audio_callback = AudioCallback(self.__silence_flag, self.__player)
+		self.__generation = SpeechGeneration()
+		self.__audio_callback = AudioCallback(self.__generation, self.__player)
 
 		self.__c_audio_callback = NEWFON_CALLBACK(self.__audio_callback)
 		self.__tts = self.__newfon_lib.tts_create(self.__c_audio_callback)
@@ -468,8 +479,6 @@ class SynthDriver(SynthDriver):
 		self.__newfon_lib.tts_setVolume(self.__tts, self.__volume/100)
 		self.__useRulex = True
 		self.__language = DEFAULT_LANGUAGE
-		self.__pseudoEnglishPronunciation = True
-		en.options["pseudoEnglishPronunciation"] = True
 
 		self.__task_queue = queue.Queue()
 		self.__task_thread = TaskThread(self.__task_queue)
@@ -501,40 +510,75 @@ class SynthDriver(SynthDriver):
 		finally:
 			self.__newfon_lib = None
 
-	def _getUserConfiguration(self):
+	@staticmethod
+	def _openUserConfiguration(path):
 		with open(CONFIG_SPEC_PATH, encoding="utf-8") as spec:
-			conf = ConfigObj(infile=str(CONFIG_FILE_PATH), configspec=spec, encoding="utf-8", default_encoding="utf-8")
-		val = Validator()
-		conf.validate(val, copy=True)
+			return ConfigObj(infile=path, configspec=spec, encoding="utf-8", default_encoding="utf-8")
+
+	def _loadUserConfiguration(self):
+		try:
+			conf = self._openUserConfiguration(str(CONFIG_FILE_PATH))
+			writable = not globalVars.appArgs.secure
+		except Exception:
+			log.error(f"newfon: failed to read {CONFIG_FILE_PATH}, defaults from config.spec are used", exc_info=True)
+			conf = self._openUserConfiguration(None)
+			# Файл с ошибкой не перезаписываем, чтобы не потерять правки пользователя
+			writable = False
+		validator = Validator()
+		result = conf.validate(validator, copy=True, preserve_errors=True)
+		if result is not True:
+			# Без этого недопустимое значение оставалось строкой: например,
+			# dec_sep_point = нет превращалось в True, и дроби не выключались
+			for sections, key, error in flatten_errors(conf, result):
+				if key is None:
+					continue
+				section = conf
+				for name in sections:
+					section = section[name]
+				section[key] = validator.get_default_value(section.configspec[key])
+				log.warning(f"newfon: invalid value of {'/'.join(sections + [key])} in {CONFIG_FILE_PATH}, the default {section[key]!r} is used: {error}")
 		params = conf["Parameters"]
 		params["interpolation_multiplier"] = _normalizeInterpolationMultiplier(params["interpolation_multiplier"])
 		params["interpolation_algorithm"] = _normalizeInterpolationAlgorithm(params["interpolation_algorithm"])
+		self.__configWritable = writable
 		self._writeUserConfiguration(conf)
 		return conf
 
 	def _writeUserConfiguration(self, conf=None):
 		if conf is None:
 			conf = self.__user_config
-		if not globalVars.appArgs.secure:
-			try:
-				conf.write()
-			except OSError:
-				log.error("newfon: failed to write config file", exc_info=True)
+		if not self.__configWritable:
+			return
+		try:
+			conf.write()
+		except OSError:
+			log.error("newfon: failed to write config file", exc_info=True)
+
+	def _applyTextConfiguration(self):
+		conf = self.__user_config
+		self.__characters = _characterMap(conf["Characters"])
+		self.__singleCharacters = _characterMap(conf["SingleCharacters"])
 
 	def saveSettings(self):
 		super().saveSettings()
 		self._saveInterpolationConfiguration()
-		self._saveSpeechAlgorithm()
+		self._saveSpeechFlags()
 
 	def loadSettings(self, onlyChanged=False):
 		super().loadSettings(onlyChanged=onlyChanged)
 		if onlyChanged or not hasattr(self, "_SynthDriver__user_config"):
 			return
+		# newfon.ini перечитывается, чтобы правки, сделанные в нём вручную,
+		# применялись при возврате к сохранённой конфигурации без перезапуска NVDA
+		self.__user_config = self._loadUserConfiguration()
 		params = self.__user_config["Parameters"]
 		self.samplesPerSec = str(params["samples_per_sec"])
 		self.interpolationMultiplier = str(params["interpolation_multiplier"])
 		self.interpolationAlgorithm = str(params["interpolation_algorithm"])
 		self.useLegacyRateAlgo = bool(params["UseLegacyRateAlgo"])
+		self.decimalFractionsPoint = bool(params["dec_sep_point"])
+		self.decimalFractionsComma = bool(params["dec_sep_comma"])
+		self._applyTextConfiguration()
 
 	def _createPlayer(self):
 		return nvwave.WavePlayer(
@@ -582,19 +626,21 @@ class SynthDriver(SynthDriver):
 		self.__task_queue.put(task)
 
 	def speak(self, speechSequence):
+		generation = self.__generation.value
+		language = self.__language
+		useRulex = self.__useRulex
 		textList = []
-		indexes = []
 		pitchChanged = False
-		pauseChanged = False
 		for item in speechSequence:
 			if isinstance(item, str):
 				textList.append(item)
 			elif isinstance(item, IndexCommand):
-				# Как и в Newfon, индекс не разрывает фразу: он только
-				# отмечает место, о котором нужно сообщить NVDA. Иначе
-				# сообщение, собранное из нескольких частей, звучало бы
-				# как несколько отдельных фраз
-				indexes.append(item.index)
+				# Индекс сообщается в том месте, где он стоит в последовательности.
+				# NVDA вешает на индексы звуки: например, звуковой отступ идёт
+				# индексом перед строкой, и сообщать о нём после всей фразы нельзя
+				self._queueText(generation, textList, language, useRulex)
+				textList = []
+				self.__task_queue.put(SpeechTask(self._indexTask, generation, item.index))
 			elif isinstance(item, PitchCommand):
 				# Как и в Newfon, высота задаётся произносимому куску целиком,
 				# причём берётся первая из полученных команд. NVDA обрамляет
@@ -607,78 +653,108 @@ class SynthDriver(SynthDriver):
 				# Как и в Newfon, длительность паузы передаётся ядру напрямую
 				# и отрабатывается завершающей паузой произносимого куска
 				self._setParameter(PAUSE_PARAM, max(PAUSE_MIN, min(item.time, 255)))
-				self.do_speak(textList, indexes)
+				self._queueText(generation, textList, language, useRulex)
 				textList = []
-				indexes = []
-				pauseChanged = True
+				self._setParameter(PAUSE_PARAM, self.__pauseBetweenPhrases)
 			elif isinstance(item, SpeechCommand):
 				log.debugWarning(f"Unsupported speech command: {item}")
 			else:
 				log.error(f"Unknown speech: {item}")
-		self.do_speak(textList, indexes)
+		self._queueText(generation, textList, language, useRulex)
 		if pitchChanged:
 			self._setParameter(PITCH_PARAM, self.__pitch)
-		if pauseChanged:
-			self._setParameter(PAUSE_PARAM, self.__pauseBetweenPhrases)
-		self.__task_queue.put(DoneSpeaking(self.__player, self._onIndexReached))
+		self.__task_queue.put(SpeechTask(self._doneSpeakingTask, generation))
 
-	def do_speak(self, textList, indexes=()):
-		indexes = tuple(indexes)
-		text = "".join(textList).strip()
-		if not text and not indexes:
+	def _queueText(self, generation, textList, language, useRulex):
+		if not "".join(textList).strip():
 			return
-		if self.__normalizationForm is not None:
-			text = unicodedata.normalize(self.__normalizationForm, text)
-		if self.__language == DEFAULT_LANGUAGE:
+		# Текст готовится в рабочем потоке, а не здесь. На длинных текстах
+		# подготовка и поиск по словарю занимают заметное время, и пока они
+		# шли в основном потоке, NVDA не могла обработать команду заглушить речь
+		self.__task_queue.put(SpeechTask(self._speakTask, generation, tuple(textList), language, useRulex))
+
+	def _isCancelled(self, generation):
+		return generation != self.__generation.value
+
+	def _speakTask(self, generation, textList, language, useRulex):
+		if self._isCancelled(generation):
+			return
+		text = self._processText("".join(textList).strip(), language)
+		for chunk in _sourceSegments(text):
+			if self._isCancelled(generation):
+				return
+			data = self._encodeChunk(chunk, language, useRulex)
+			if data:
+				self.__audio_callback.speechGeneration = generation
+				self.__newfon_lib.tts_speak(self.__tts, byref(self.__config), data)
+
+	def _indexTask(self, generation, index):
+		if self._isCancelled(generation):
+			return
+		def onDone():
+			if not self._isCancelled(generation):
+				synthIndexReached.notify(synth=self, index=index)
+		# Пустой кусок с onDone проигрыватель отмечает, когда доиграет всё
+		# переданное до него, так что NVDA узнаёт об индексе ровно тогда,
+		# когда до него дошла речь. Так же индексы сообщает eSpeak
+		self.__player.feed(b"", onDone=onDone)
+
+	def _doneSpeakingTask(self, generation):
+		if self._isCancelled(generation):
+			return
+		self.__player.idle()
+		if not self._isCancelled(generation):
+			synthDoneSpeaking.notify(synth=self)
+
+	def _processText(self, text, language):
+		if language == DEFAULT_LANGUAGE:
 			if len(text) == 1:
-				text = self.__user_config["SingleCharacters"].get(text.lower(), text)
+				text = self.__singleCharacters.get(text.lower(), text)
 			else:
 				text = RE_CAMEL_CASE.sub(" ", text)
 				text = RE_SINGLE_LATIN.sub(self._singleLatinSearch, text)
 				text = RE_ABBREVIATIONS.sub(self._abbreviationSearch, text)
 				text = RE_LETTER_AFTER_NUMBER.sub(self._letterAfterNumberSearch, text)
-				text = "".join([self.__user_config["Characters"].get(ch.lower(), ch) for ch in text])
-			text = RE_WORDS.sub(self._wordsSearch, text)
 		else:
 			# Остальные языки приводит к произносимому виду модуль языка,
 			# как это делал Newfon. Словарь RuLex здесь не применяется
 			try:
-				text = LANGUAGE_MODULES[self.__language].process(text, self.__language)
+				text = LANGUAGE_MODULES[language].process(text, language)
 			except Exception:
-				log.error(f"newfon: {self.__language} text processing failed", exc_info=True)
-		text = text.translate(SINGLE_CHARACTER_TRANSLATION_DICT)
-		text = RE_BRAILLE_PATTERNS.sub(self._brailleDotsSearch, text)
-		task = SpeakText(text, self.__newfon_lib, self.__tts, self.__config, self.__silence_flag, indexes, self._onIndexReached)
-		self.__task_queue.put(task)
+				log.error(f"newfon: {language} text processing failed", exc_info=True)
+		return text
+
+	def _encodeChunk(self, chunk, language, useRulex):
+		chunk = " ".join(chunk.split())
+		if language == DEFAULT_LANGUAGE:
+			chunk = RE_WORDS.sub(lambda match: self._wordsSearch(match, useRulex), chunk)
+			# Замены из секции Characters делаются после словаря, чтобы в словарь
+			# попадали только слова исходного текста, а не куски замен:
+			# отдельно стоящее «ку» RuLex, например, превращает в «ку+»
+			characters = self.__characters
+			chunk = "".join([characters.get(ch.lower(), ch) for ch in chunk])
+		chunk = chunk.translate(SINGLE_CHARACTER_TRANSLATION_DICT)
+		chunk = RE_BRAILLE_PATTERNS.sub(self._brailleDotsSearch, chunk)
+		return b''.join([c if c else b' ' for c in [c.encode("koi8-r", errors="ignore") for c in chunk]])
 
 	def pause(self, switch):
 		self.__player.pause(switch)
 
 	def cancel(self):
+		# Новое поколение объявляется первым: всё, что рабочий поток возьмёт
+		# после этого, увидит отмену и ничего не сделает
+		self.__generation.value += 1
 		tasks = []
 		try:
 			while True:
 				task = self.__task_queue.get_nowait()
-				if not isinstance(task, SpeakText):
+				if not isinstance(task, SpeechTask):
 					tasks.append(task)
 		except queue.Empty:
 			pass
 		for task in tasks:
 			self.__task_queue.put(task)
-		self.__silence_flag.set()
-		self.__task_queue.put(self.__silence_flag.clear)
 		self.__player.stop()
-
-	def _singleLatinSearch(self, match):
-		ch = match.group().lower()
-		return self.__user_config["SingleCharacters"].get(ch, ch)
-
-	def _abbreviationSearch(self, match):
-		word = match.group().lower()
-		return " ".join([self.__user_config["SingleCharacters"].get(ch, ch) for ch in word])
-
-	def _letterAfterNumberSearch(self, match):
-		return " ".join(match.group())
 
 	def _brailleDotsSearch(self, match):
 		ch = match.group()
@@ -694,19 +770,24 @@ class SynthDriver(SynthDriver):
 			dotLabels.append("брайлевские точки" if len(dotLabels) > 1 else "брайлевская точка")
 			return f" {' '.join(dotLabels)} "
 
-	def _wordsSearch(self, match):
+	def _singleLatinSearch(self, match):
+		ch = match.group().lower()
+		return self.__singleCharacters.get(ch, ch)
+
+	def _abbreviationSearch(self, match):
+		word = match.group().lower()
+		return " ".join([self.__singleCharacters.get(ch, ch) for ch in word])
+
+	def _letterAfterNumberSearch(self, match):
+		return " ".join(match.group())
+
+	def _wordsSearch(self, match, useRulex):
 		word = match.group()
 		if "́" in word: # Проверяем наличие знака ударения
 			return word.replace("́", "+", 1)
-		if self.__useRulex and (self.__rulex_dict is not None):
+		if useRulex and (self.__rulex_dict is not None):
 			return self.__rulex_dict.search(word)
 		return word
-
-	def _onIndexReached(self, index):
-		if index is not None:
-			synthIndexReached.notify(synth=self, index=index)
-		else:
-			synthDoneSpeaking.notify(synth=self)
 
 	def _get_language(self):
 		return self.__language
@@ -737,6 +818,12 @@ class SynthDriver(SynthDriver):
 			flags |= USE_LEGACY_RATE_ALGO
 		return flags
 
+	def _updateSpeechFlags(self):
+		self._setParameter(FLAGS_PARAM, self._speechFlags())
+		# NVDA не вызывает saveSettings при изменении параметра через кольцо
+		# настроек, поэтому запоминаем выбор сразу
+		self._saveSpeechFlags()
+
 	def _get_useLegacyRateAlgo(self):
 		return self.__useLegacyRateAlgo
 
@@ -745,21 +832,36 @@ class SynthDriver(SynthDriver):
 		if value == self.__useLegacyRateAlgo:
 			return
 		self.__useLegacyRateAlgo = value
-		self._setParameter(FLAGS_PARAM, self._speechFlags())
-		self._saveSpeechAlgorithm()
+		self._updateSpeechFlags()
 
-	def _saveSpeechAlgorithm(self):
+	def _get_decimalFractionsPoint(self):
+		return self.__decSepPoint
+
+	def _set_decimalFractionsPoint(self, value):
+		value = bool(value)
+		if value == self.__decSepPoint:
+			return
+		self.__decSepPoint = value
+		self._updateSpeechFlags()
+
+	def _get_decimalFractionsComma(self):
+		return self.__decSepComma
+
+	def _set_decimalFractionsComma(self, value):
+		value = bool(value)
+		if value == self.__decSepComma:
+			return
+		self.__decSepComma = value
+		self._updateSpeechFlags()
+
+	def _saveSpeechFlags(self):
 		if not hasattr(self, "_SynthDriver__user_config"):
 			return
-		self.__user_config["Parameters"]["UseLegacyRateAlgo"] = self.__useLegacyRateAlgo
+		params = self.__user_config["Parameters"]
+		params["UseLegacyRateAlgo"] = self.__useLegacyRateAlgo
+		params["dec_sep_point"] = self.__decSepPoint
+		params["dec_sep_comma"] = self.__decSepComma
 		self._writeUserConfiguration()
-
-	def _get_pseudoEnglishPronunciation(self):
-		return self.__pseudoEnglishPronunciation
-
-	def _set_pseudoEnglishPronunciation(self, value):
-		self.__pseudoEnglishPronunciation = bool(value)
-		en.options["pseudoEnglishPronunciation"] = self.__pseudoEnglishPronunciation
 
 	def _getAvailableVoices(self):
 		voices = OrderedDict()

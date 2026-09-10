@@ -31,8 +31,11 @@ msgstr "Алгоритм интерполяции"
 msgid "Use the old sound transition algorithm"
 msgstr "Старый алгоритм изменения скорости"
 
-msgid "Include pseudo &english pronunciation"
-msgstr "Псевдо&английское произношение"
+msgid "Read decimal fractions with a point"
+msgstr "Читать десятичные дроби с точкой"
+
+msgid "Read decimal fractions with a comma"
+msgstr "Читать десятичные дроби с запятой"
 
 msgid "Use RuLex pronunciation dictionary"
 msgstr "Использовать словарь произношений RuLex"
