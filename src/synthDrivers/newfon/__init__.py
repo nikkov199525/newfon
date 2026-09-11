@@ -33,7 +33,7 @@ except ImportError: # NVDA ниже 2020.1
 	from driverHandler import DriverSetting, NumericDriverSetting, BooleanDriverSetting, StringParameterInfo
 from logHandler import log
 
-from .languages import hr, pl, ru, sr, uk
+from .languages import en, hr, pl, ru, sr, uk
 
 addonHandler.initTranslation()
 
@@ -59,14 +59,17 @@ SINGLE_CHARACTER_TRANSLATION_DICT = {
 	ord(')'): ' ',
 }
 
+# Кроме русского алфавита частью слова считаются дореформенные буквы и буквы
+# других кириллических алфавитов, которые заменяет секция Characters
+EXTRA_LETTERS = "іѣѳѵўґІѢѲѴЎҐ"
 # Регулярные выражения для коррекции произношения
-RE_WORDS = re.compile("[а-яё́]+", re.I)
+RE_WORDS = re.compile(f"[а-яё{EXTRA_LETTERS}́]+", re.I)
 # По буквам читаются только сплошные согласные: ТТС, ФСБ, HTML, PNG.
 # Слова с гласными (POCO, OZON, ВНИМАНИЕ, НАТО, GIF) не трогаем.
 RE_ABBREVIATIONS = re.compile(
-	r"(?<![а-яёА-ЯЁa-zA-Z])"
+	f"(?<![а-яёА-ЯЁa-zA-Z{EXTRA_LETTERS}])"
 	r"(?i:[bcdfghjklmnpqrstvwxzбвгджзклмнпрстфхцчшщ]{2,})"
-	r"(?![а-яёА-ЯЁa-zA-Z])"
+	f"(?![а-яёА-ЯЁa-zA-Z{EXTRA_LETTERS}])"
 )
 
 # Разрезает camelCase, чтобы аббревиатура внутри слова стала отдельным
@@ -77,6 +80,12 @@ RE_CAMEL_CASE = re.compile(
 )
 RE_LETTER_AFTER_NUMBER = re.compile(r"\d[а-яёa-z]", re.I)
 RE_SINGLE_LATIN = re.compile(r"(?<![а-яёa-z])[a-z](?![а-яёa-z])", re.I)
+# Символы KOI8-R, которые ядро не умеет читать: псевдографика │ ─ ║ ■,
+# знаки ° ² ≤ ≥ √ © и неразрывный пробел, то есть всё от 0x80 до 0xBF,
+# кроме ё и Ё. Ядро не пропускает их, а примешивает к речи, и «ratings │»
+# звучит как «ratingzz». Такие символы заменяются пробелом, если их нет
+# ни в одной секции newfon.ini
+UNREADABLE_CHARACTERS = frozenset(bytes(range(0x80, 0xC0)).decode("koi8-r")) - {"ё", "Ё"}
 RE_BRAILLE_PATTERNS = re.compile(r"[⠀-⣿]")
 
 def _characterMap(section):
@@ -90,6 +99,12 @@ def _characterMap(section):
 			value = ", ".join(value)
 		result[ch] = str(value)
 	return result
+
+def _cyrillicPart(table):
+	return {ch: value for ch, value in table.items() if "Ѐ" <= ch <= "ӿ"}
+
+def _latinPart(table):
+	return {ch: value for ch, value in table.items() if "a" <= ch <= "z"}
 
 # Text chunking mirrors the Android driver: a short first segment keeps
 # startup latency low, while larger following segments reduce core restarts.
@@ -558,6 +573,13 @@ class SynthDriver(SynthDriver):
 		conf = self.__user_config
 		self.__characters = _characterMap(conf["Characters"])
 		self.__singleCharacters = _characterMap(conf["SingleCharacters"])
+		# Символ, для которого пользователь задал замену или название
+		# в любой секции newfon.ini, не выбрасывается
+		self.__unreadableCharacters = UNREADABLE_CHARACTERS.difference(self.__characters, self.__singleCharacters)
+		# Таблицы нужны и модулям других языков: кириллическую часть хорватский,
+		# польский и сербский берут из ru, а латинскую украинский берёт из en
+		ru.setCharacters(_cyrillicPart(self.__singleCharacters), _cyrillicPart(self.__characters))
+		en.setCharacters(_latinPart(self.__singleCharacters), _latinPart(self.__characters))
 
 	def saveSettings(self):
 		super().saveSettings()
@@ -727,14 +749,24 @@ class SynthDriver(SynthDriver):
 	def _encodeChunk(self, chunk, language, useRulex):
 		chunk = " ".join(chunk.split())
 		if language == DEFAULT_LANGUAGE:
-			chunk = RE_WORDS.sub(lambda match: self._wordsSearch(match, useRulex), chunk)
-			# Замены из секции Characters делаются после словаря, чтобы в словарь
-			# попадали только слова исходного текста, а не куски замен:
-			# отдельно стоящее «ку» RuLex, например, превращает в «ку+»
-			characters = self.__characters
-			chunk = "".join([characters.get(ch.lower(), ch) for ch in chunk])
+			# Замены из секции Characters делаются один раз. Внутри русских слов
+			# они идут до словаря, чтобы словарь искал слово таким, каким оно
+			# прозвучит: хлѣбъ как хлебъ. В остальном тексте словарь не нужен:
+			# куски замен, прилипшие к латинице, он принял бы за русские слова
+			parts = []
+			start = 0
+			for match in RE_WORDS.finditer(chunk):
+				parts.append(self._replaceCharacters(chunk[start:match.start()]))
+				parts.append(self._wordsSearch(self._replaceCharacters(match.group()), useRulex))
+				start = match.end()
+			parts.append(self._replaceCharacters(chunk[start:]))
+			chunk = "".join(parts)
 		chunk = chunk.translate(SINGLE_CHARACTER_TRANSLATION_DICT)
 		chunk = RE_BRAILLE_PATTERNS.sub(self._brailleDotsSearch, chunk)
+		# Нечитаемые символы заменяются пробелом, как и символы, которых
+		# нет в KOI8-R, чтобы не склеивать слова по обе стороны от них
+		unreadable = self.__unreadableCharacters
+		chunk = "".join([" " if ch in unreadable else ch for ch in chunk])
 		return b''.join([c if c else b' ' for c in [c.encode("koi8-r", errors="ignore") for c in chunk]])
 
 	def pause(self, switch):
@@ -781,8 +813,11 @@ class SynthDriver(SynthDriver):
 	def _letterAfterNumberSearch(self, match):
 		return " ".join(match.group())
 
-	def _wordsSearch(self, match, useRulex):
-		word = match.group()
+	def _replaceCharacters(self, text):
+		characters = self.__characters
+		return "".join([characters.get(ch.lower(), ch) for ch in text])
+
+	def _wordsSearch(self, word, useRulex):
 		if "́" in word: # Проверяем наличие знака ударения
 			return word.replace("́", "+", 1)
 		if useRulex and (self.__rulex_dict is not None):

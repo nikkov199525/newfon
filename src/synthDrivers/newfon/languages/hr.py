@@ -8,8 +8,6 @@ try:
 except ImportError: # for NVDA below 2019.3
 	import ru,sh_numbers
 
-options = {}
-
 letters = {
 'a': "а",
 'b': "бэ",
@@ -71,16 +69,12 @@ re_decimalFractions = re.compile(r"\d+(\.)\d+")
 re_numbers = re.compile(r"(\d+)", re.U)
 re_afterNumber = re.compile(r"(\d+)([^\.\:\-\/\!\?\d])", re.U)
 re_omittedCharacters = re.compile("['\\(\\)\\*„_\\\"‘’«»‚]+", re.U)
-re_zeros = re.compile(r"\b\a?\.?(0+)")
-zeros = {
-'ru': u'ноль ',
-'uk': u'нуль ',
-}
 re_stress = re.compile("([аеёиоуыэюяіѣѵ])́", re.U|re.I)
 
-AllLetters = {}
-AllLetters.update(letters)
-AllLetters.update(ru.letters)
+def letterName(letter):
+	# Названия кириллических букв берутся из ru.letters в момент чтения:
+	# драйвер заполняет их из newfon.ini уже после загрузки модулей
+	return letters.get(letter, ru.letters.get(letter, letter))
 
 def expandAbbreviation(match):
 	loweredText = match.group(1).lower()
@@ -88,7 +82,7 @@ def expandAbbreviation(match):
 	if (match.group(1).isupper() and (l <= abbreviationsLength and l > 1) and re_capAbbreviations.match(match.group(1))) or re_abbreviations.match(loweredText):
 		expandedText = ""
 		for letter in loweredText:
-			expandedText += AllLetters[letter] if letter in AllLetters else letter
+			expandedText += letterName(letter)
 			if letter.isalpha(): expandedText+=" "
 		return expandedText
 	return loweredText

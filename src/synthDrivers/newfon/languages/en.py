@@ -4,87 +4,36 @@
 
 import re
 
-options = {}
+# Названия латинских букв (letters) и замены латинских символов (pronunciation)
+# берутся из секций SingleCharacters и Characters файла newfon.ini. Драйвер
+# передаёт сюда их латинскую часть через setCharacters
+letters = {}
+pronunciation = {}
 
-letters = {
-	'a': "эй",
-	'b': "би",
-	'c': "си",
-	'd': "ди",
-	'e': "и",
-	'f': "эф",
-	'g': "джи",
-	'h': "эйчь",
-	'i': "ай",
-	'j': "джей",
-	'k': "кей",
-	'l': "эл",
-	'm': "эм",
-	'n': "эн",
-	'o': "оу",
-	'p': "пи",
-	'q': "къю",
-	'r': "ар",
-	's': "эс",
-	't': "ти",
-	'u': "ю",
-	'v': "ви",
-	'w': "да+блъю",
-	'x': "экс",
-	'y': "вай",
-	'z': "зэт",
-}
-
-latin = {
-	'a': "а",
-	'b': "бэ",
-	'c': "цэ",
-	'd': "дэ",
-	'e': "е",
-	'f': "эф",
-	'g': "гэ",
-	'h': "ха",
-	'i': "и",
-	'j': "ёт",
-	'k': "ка",
-	'l': "эл",
-	'm': "эм",
-	'n': "эн",
-	'o': "о",
-	'p': "пи",
-	'q': "ку",
-	'r': "эр",
-	's': "эс",
-	't': "тэ",
-	'u': "у",
-	'v': "вэ",
-	'w': "дубль вэ",
-	'x': "икс",
-	'y': "игрек",
-	'z': "зэт",
-}
-
-
-pronunciation = {
-	'x': "кс",
+# Сочетания букв. Заменяются раньше отдельных символов
+rules = {
 	'ee': "е е",
-	'e': "е",
-	'y': "ы",
-	'j': "дж",
 }
-
 
 re_englishLetters = re.compile(r"\b([a-zA-Z])\b")
-re_stress = re.compile("([аеёиоуыэюяіѣѵ])́", re.U|re.I)
 re_dash = re.compile(r"(\w)-(\w)")
+
+def setCharacters(letterNames, replacements):
+	global letters, pronunciation
+	# Таблицы подменяются целиком, а не правятся на месте,
+	# потому что рабочий поток может как раз читать их
+	letters = dict(letterNames)
+	pronunciation = dict(replacements)
 
 def subEnglishLetters(match):
 	letter = match.group(1).lower()
-	return letters[letter]
+	return letters.get(letter, letter)
 
 def preprocessText(text):
 	text = re_dash.sub(r"\1 - \2", text)
 	text = re_englishLetters.sub(subEnglishLetters, text)
+	for s in rules:
+		text = text.replace(s, rules[s])
 	for s in pronunciation:
 		text = text.replace(s, pronunciation[s])
 	return text

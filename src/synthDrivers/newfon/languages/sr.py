@@ -8,8 +8,6 @@ try:
 except ImportError: # for NVDA below 2019.3
 	import hr,ru,sh_numbers
 
-options = {}
-
 letters = {
 "е": "э",
 "л": "эл",
@@ -46,12 +44,14 @@ re_decimalFractions = re.compile(r"\d+(\.)\d+")
 re_numbers = re.compile(r"(\d+)", re.U)
 re_afterNumber = re.compile(r"(\d+)([^\.\:\-\/\!\?\d])", re.U)
 re_omittedCharacters = re.compile("['\\(\\)\\*„_\\\"‘’«»‚]+", re.U)
-re_stress = re.compile("([аеёиоуыэюяіѣѵ])́", re.U|re.I)
-
-allLetters = {}
-allLetters.update(ru.letters)
-allLetters.update(hr.letters)
-allLetters.update(letters)
+def letterName(letter):
+	# Сербские названия важнее хорватских, а те важнее русских. Русские
+	# берутся из ru.letters в момент чтения: драйвер заполняет их из
+	# newfon.ini уже после загрузки модулей
+	for table in (letters, hr.letters, ru.letters):
+		if letter in table:
+			return table[letter]
+	return letter
 
 def expandAbbreviation(match):
 	loweredText = match.group(1).lower()
@@ -59,7 +59,7 @@ def expandAbbreviation(match):
 	if (match.group(1).isupper() and (l <= abbreviationsLength and l > 1) and re_capAbbreviations.match(match.group(1))) or re_abbreviations.match(loweredText):
 		expandedText = ""
 		for letter in loweredText:
-			expandedText += allLetters[letter] if letter in allLetters else letter
+			expandedText += letterName(letter)
 			if letter.isalpha(): expandedText+=" "
 		return expandedText
 	return loweredText
