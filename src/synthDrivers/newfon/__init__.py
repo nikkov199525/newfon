@@ -22,9 +22,9 @@ try:
 except ImportError: # NVDA ниже 2023.1
 	from validate import Validator
 try:
-	from speech.commands import IndexCommand, PitchCommand, BreakCommand, SpeechCommand
+	from speech.commands import IndexCommand, PitchCommand, RateCommand, VolumeCommand, BreakCommand, SpeechCommand
 except ImportError: # NVDA ниже 2021.1
-	from speech import IndexCommand, PitchCommand, BreakCommand, SpeechCommand
+	from speech import IndexCommand, PitchCommand, RateCommand, VolumeCommand, BreakCommand, SpeechCommand
 from synthDriverHandler import SynthDriver, VoiceInfo, LanguageInfo, synthIndexReached, synthDoneSpeaking
 try:
 	from autoSettingsUtils.driverSetting import DriverSetting, NumericDriverSetting, BooleanDriverSetting
@@ -227,6 +227,9 @@ class NEWFON_CONF_T(Structure):
 		("flags", c_int),
 	]
 
+
+PROSODY_COMMANDS = (PitchCommand, RateCommand, VolumeCommand)
+
 # Параметры синтезатора настраиваемые через графический интерфейс
 VOICE_PARAM = "voice"
 SPEECH_RATE_PARAM = "speech_rate"
@@ -420,7 +423,7 @@ class SynthDriver(SynthDriver):
 			settings.append(rulexSetting)
 		return settings
 
-	supportedCommands = {IndexCommand, PitchCommand, BreakCommand}
+	supportedCommands = {IndexCommand, PitchCommand, RateCommand, VolumeCommand, BreakCommand}
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
 
 	def __init__(self):
@@ -652,7 +655,7 @@ class SynthDriver(SynthDriver):
 		language = self.__language
 		useRulex = self.__useRulex
 		textList = []
-		pitchChanged = False
+		changedProsody = {}
 		for item in speechSequence:
 			if isinstance(item, str):
 				textList.append(item)
@@ -663,14 +666,10 @@ class SynthDriver(SynthDriver):
 				self._queueText(generation, textList, language, useRulex)
 				textList = []
 				self.__task_queue.put(SpeechTask(self._indexTask, generation, item.index))
-			elif isinstance(item, PitchCommand):
-				# Как и в Newfon, высота задаётся произносимому куску целиком,
-				# причём берётся первая из полученных команд. NVDA обрамляет
-				# заглавную букву парой команд, и именно первая из них поднимает
-				# высоту, а вторая возвращает её для следующих кусков
-				if not pitchChanged:
-					self._setParameter(PITCH_PARAM, item.newValue)
-					pitchChanged = True
+			elif isinstance(item, PROSODY_COMMANDS):
+				self._queueText(generation, textList, language, useRulex)
+				textList = []
+				changedProsody[type(item)] = self._setProsody(item)
 			elif isinstance(item, BreakCommand):
 				# Как и в Newfon, длительность паузы передаётся ядру напрямую
 				# и отрабатывается завершающей паузой произносимого куска
@@ -683,9 +682,31 @@ class SynthDriver(SynthDriver):
 			else:
 				log.error(f"Unknown speech: {item}")
 		self._queueText(generation, textList, language, useRulex)
-		if pitchChanged:
-			self._setParameter(PITCH_PARAM, self.__pitch)
+		for command, value in changedProsody.items():
+			setting = self._prosodySetting(command)
+			if value != setting:
+				self._applyProsody(command, setting)
 		self.__task_queue.put(SpeechTask(self._doneSpeakingTask, generation))
+
+	def _setProsody(self, command):
+		value = max(0, min(100, command.newValue))
+		self._applyProsody(type(command), value)
+		return value
+
+	def _applyProsody(self, command, value):
+		if command is PitchCommand:
+			self._setParameter(PITCH_PARAM, value)
+		elif command is RateCommand:
+			self._setParameter(SPEECH_RATE_PARAM, _rateToParam(value))
+		else:
+			self._queueVolume(value)
+
+	def _prosodySetting(self, command):
+		if command is PitchCommand:
+			return self.__pitch
+		if command is RateCommand:
+			return self.__rate
+		return self.__volume
 
 	def _queueText(self, generation, textList, language, useRulex):
 		if not "".join(textList).strip():
@@ -965,6 +986,9 @@ class SynthDriver(SynthDriver):
 
 	def _set_volume(self, volume):
 		self.__volume = volume
+		self._queueVolume(volume)
+
+	def _queueVolume(self, volume):
 		task = lambda: self.__newfon_lib.tts_setVolume(self.__tts, volume/100)
 		self.__task_queue.put(task)
 
