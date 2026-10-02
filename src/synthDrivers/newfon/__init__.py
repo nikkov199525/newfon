@@ -71,6 +71,14 @@ RE_ABBREVIATIONS = re.compile(
 	r"(?i:[bcdfghjklmnpqrstvwxzбвгджзклмнпрстфхцчшщ]{2,})"
 	f"(?![а-яёА-ЯЁa-zA-Z{EXTRA_LETTERS}])"
 )
+# Как в оригинальном Newfon, по буквам читаются и короткие, в 3–4 буквы,
+# слова из заглавных, которые начинаются с трёх согласных: NVDA, SCSI, ВСНХ.
+# НАТО, GIF и ОЗОН под это правило не попадают и читаются словом
+RE_CAP_ABBREVIATIONS = re.compile(
+	f"(?<![а-яёА-ЯЁa-zA-Z{EXTRA_LETTERS}])"
+	r"(?=[BCDFGHJKLMNPQRSTVWXZБВГДЖЗКЛМНПРСТФХЦЧШЩ]{3})[A-ZА-ЯЁ]{3,4}"
+	f"(?![а-яёА-ЯЁa-zA-Z{EXTRA_LETTERS}])"
+)
 
 # Разрезает camelCase, чтобы аббревиатура внутри слова стала отдельным
 # фрагментом: chatGPT -> "chat GPT", RuTTS -> "Ru TTS", TTSEngine -> "TTS Engine".
@@ -756,6 +764,7 @@ class SynthDriver(SynthDriver):
 			else:
 				text = RE_CAMEL_CASE.sub(" ", text)
 				text = RE_SINGLE_LATIN.sub(self._singleLatinSearch, text)
+				text = RE_CAP_ABBREVIATIONS.sub(self._abbreviationSearch, text)
 				text = RE_ABBREVIATIONS.sub(self._abbreviationSearch, text)
 				text = RE_LETTER_AFTER_NUMBER.sub(self._letterAfterNumberSearch, text)
 		else:

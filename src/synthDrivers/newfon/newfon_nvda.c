@@ -35,11 +35,15 @@ static int writeSamplesToConsumer(TTS_t *tts, const short *samples, int numSampl
 		return tts->consumer((void*)samples, (size_t)numSamples, NULL) ? FAILURE : SUCCESS;
 	}
 
-	src_short_to_float_array(samples, tts->resampler_input, numSamples);
+	// Отсчёты кладутся со второй ячейки. Линейный интерполятор libsamplerate,
+	// получив отсчёт-другой, читает data_in[-1], то есть ячейку перед буфером.
+	// Там лежит последний отсчёт прошлой порции: его же интерполятор и ждёт
+	float *input = tts->resampler_input + 1;
+	src_short_to_float_array(samples, input, numSamples);
 	long inputOffset = 0;
 	while (inputOffset < numSamples) {
 		SRC_DATA data = {0};
-		data.data_in = tts->resampler_input + inputOffset;
+		data.data_in = input + inputOffset;
 		data.input_frames = numSamples - inputOffset;
 		data.data_out = tts->resampler_output;
 		data.output_frames = RESAMPLED_WAVE_SIZE;
@@ -64,6 +68,7 @@ static int writeSamplesToConsumer(TTS_t *tts, const short *samples, int numSampl
 		}
 		inputOffset += data.input_frames_used;
 	}
+	tts->resampler_input[0] = input[numSamples - 1];
 	return SUCCESS;
 }
 
@@ -71,6 +76,7 @@ static int flushResampler(TTS_t *tts) {
 	if (tts->converter == NULL || tts->interpolation_multiplier == 1) {
 		return SUCCESS;
 	}
+	tts->resampler_input[0] = 0.0f;
 
 	while (1) {
 		SRC_DATA data = {0};
@@ -131,7 +137,7 @@ NEWFON_EXPORT TTS_t* tts_create(newfon_callback wave_consumer) {
 	}
 	tts->wave_buffer = malloc(WAVE_SIZE);
 	tts->samples = malloc(WAVE_SIZE * sizeof(short));
-	tts->resampler_input = malloc(WAVE_SIZE * sizeof(float));
+	tts->resampler_input = calloc(WAVE_SIZE + 1, sizeof(float));
 	tts->resampler_output = malloc(RESAMPLED_WAVE_SIZE * sizeof(float));
 	tts->resampled_buffer = malloc(RESAMPLED_WAVE_SIZE * sizeof(short));
 	if (
