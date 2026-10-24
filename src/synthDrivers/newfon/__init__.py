@@ -144,6 +144,10 @@ def _sourceSegments(text):
 						break
 			if end == 0:
 				end = hardLimit
+		# Число должно целиком попасть в ядро: разрыв внутри разряда или
+		# цепочки нулей меняет его значение и количество нулей.
+		while 0 < end < len(text) and "0" <= text[end - 1] <= "9" and "0" <= text[end] <= "9":
+			end += 1
 		while end < len(text) and text[end].isspace():
 			end += 1
 		yield text[start:end]
