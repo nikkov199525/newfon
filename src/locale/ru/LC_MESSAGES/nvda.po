@@ -28,6 +28,9 @@ msgstr "Множитель интерполяции"
 msgid "Interpolation algorithm"
 msgstr "Алгоритм интерполяции"
 
+msgid "Minimum number of leading zeros to count"
+msgstr "Подсчитывать ведущие нули начиная с"
+
 msgid "Use the old sound transition algorithm"
 msgstr "Старый алгоритм изменения скорости"
 

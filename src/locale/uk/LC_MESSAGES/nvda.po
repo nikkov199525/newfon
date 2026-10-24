@@ -27,6 +27,9 @@ msgstr "Множник інтерполяції"
 msgid "Interpolation algorithm"
 msgstr "Алгоритм інтерполяції"
 
+msgid "Minimum number of leading zeros to count"
+msgstr "Підраховувати початкові нулі починаючи з"
+
 msgid "Use the old sound transition algorithm"
 msgstr "Старий алгоритм зміни швидкості"
 

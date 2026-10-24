@@ -175,6 +175,7 @@ ACCELERATION_LEVELS = tuple(range(8))
 PAUSE_MIN = 0
 PAUSE_MAX = 100
 INTERPOLATION_MULTIPLIERS = (1, 2, 4)
+ZERO_COUNT_MIN_MAX = 100
 # Частоты дискретизации, как в старом драйвере Newfon
 SAMPLE_RATES = ("8000", "9025", "10000", "11025", "12000", "13025", "14000", "15025", "16000")
 SAMPLE_RATE_MIN = 8000
@@ -227,6 +228,7 @@ RULEXDB_EACCESS = -6
 DEC_SEP_POINT = 1 # Использовать точку в качестве десятичного разделителя
 DEC_SEP_COMMA = 2 # Использовать запятую в качестве десятичного разделителя
 USE_LEGACY_RATE_ALGO = 8 # Использовать исходный алгоритм перехода между звуками
+ZERO_COUNT_MIN_SHIFT = 8 # Порог подсчёта нулей, не меняющий размер структуры ядра
 
 class NEWFON_CONF_T(Structure):
 	_fields_ = [
@@ -385,6 +387,16 @@ class SynthDriver(SynthDriver):
 			SynthDriver.InflectionSetting(),
 			SynthDriver.VolumeSetting(),
 			NumericDriverSetting("pauseBetweenPhrases", _("&Pause between phrases"), availableInSettingsRing=True),
+			NumericDriverSetting(
+				"zeroCountMin",
+				_("Minimum number of leading zeros to count"),
+				availableInSettingsRing=True,
+				defaultVal=self.__zeroCountMin,
+				minVal=2,
+				maxVal=ZERO_COUNT_MIN_MAX,
+				normalStep=1,
+				useConfig=False,
+			),
 			DriverSetting(
 				"samplesPerSec",
 				_("&Samples per second (hz)"),
@@ -465,6 +477,7 @@ class SynthDriver(SynthDriver):
 		self.__decSepPoint = bool(params["dec_sep_point"])
 		self.__decSepComma = bool(params["dec_sep_comma"])
 		self.__useLegacyRateAlgo = bool(params["UseLegacyRateAlgo"])
+		self.__zeroCountMin = params["zero_count_min"]
 		self.__config.flags = self._speechFlags()
 		self._applyTextConfiguration()
 
@@ -608,13 +621,16 @@ class SynthDriver(SynthDriver):
 		# newfon.ini перечитывается, чтобы правки, сделанные в нём вручную,
 		# применялись при возврате к сохранённой конфигурации без перезапуска NVDA
 		self.__user_config = self._loadUserConfiguration()
-		params = self.__user_config["Parameters"]
+		# Сеттеры сразу сохраняют все связанные параметры. Берём снимок,
+		# чтобы применение одного не затёрло ещё не применённые правки ini.
+		params = dict(self.__user_config["Parameters"])
 		self.samplesPerSec = str(params["samples_per_sec"])
 		self.interpolationMultiplier = str(params["interpolation_multiplier"])
 		self.interpolationAlgorithm = str(params["interpolation_algorithm"])
 		self.useLegacyRateAlgo = bool(params["UseLegacyRateAlgo"])
 		self.decimalFractionsPoint = bool(params["dec_sep_point"])
 		self.decimalFractionsComma = bool(params["dec_sep_comma"])
+		self.zeroCountMin = params["zero_count_min"]
 		self._applyTextConfiguration()
 
 	def _createPlayer(self):
@@ -878,7 +894,7 @@ class SynthDriver(SynthDriver):
 		)
 
 	def _speechFlags(self):
-		flags = 0
+		flags = self.__zeroCountMin << ZERO_COUNT_MIN_SHIFT
 		if self.__decSepPoint:
 			flags |= DEC_SEP_POINT
 		if self.__decSepComma:
@@ -895,6 +911,16 @@ class SynthDriver(SynthDriver):
 
 	def _get_useLegacyRateAlgo(self):
 		return self.__useLegacyRateAlgo
+
+	def _get_zeroCountMin(self):
+		return self.__zeroCountMin
+
+	def _set_zeroCountMin(self, value):
+		value = max(2, min(int(value), ZERO_COUNT_MIN_MAX))
+		if value == self.__zeroCountMin:
+			return
+		self.__zeroCountMin = value
+		self._updateSpeechFlags()
 
 	def _set_useLegacyRateAlgo(self, value):
 		value = bool(value)
@@ -930,6 +956,7 @@ class SynthDriver(SynthDriver):
 		params["UseLegacyRateAlgo"] = self.__useLegacyRateAlgo
 		params["dec_sep_point"] = self.__decSepPoint
 		params["dec_sep_comma"] = self.__decSepComma
+		params["zero_count_min"] = self.__zeroCountMin
 		self._writeUserConfiguration()
 
 	def _getAvailableVoices(self):
