@@ -29,7 +29,7 @@ msgid "Interpolation algorithm"
 msgstr "Алгоритм интерполяции"
 
 msgid "Minimum number of leading zeros to count"
-msgstr "Подсчитывать ведущие нули начиная с"
+msgstr "Произносить повторяющиеся нули группаами от"
 
 msgid "Use the old sound transition algorithm"
 msgstr "Старый алгоритм изменения скорости"
